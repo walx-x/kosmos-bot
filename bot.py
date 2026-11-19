@@ -42,7 +42,7 @@ TICKET_CATEGORY_NAME = "───🎫Tickets ───"
 
 # Channel where "KoSMOS Security" posts the "KoSMOS HUB — Authentication" embeds.
 # >>> CHANGE THIS to the real name of that channel <<<
-AUTH_LOG_CHANNEL_NAME = "⮚︱auth-logs"
+AUTH_LOG_CHANNEL_NAME = "kosmoactivation"
 AUTH_LOG_SCAN_LIMIT = 1000  # how many past auth messages are scanned for Roblox usernames
 
 EXPIRY_CHECK_MINUTES = 1  # how often expired keys are removed
