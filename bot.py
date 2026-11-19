@@ -7,7 +7,7 @@ import re
 import secrets
 import string
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Dict, List, Optional, Union
 
 import aiohttp
 import discord
@@ -28,6 +28,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GITHUB_REPO = "walx-x/kosmoskeystxt"
 GITHUB_BRANCH = "main"
 FILE_PATH = "KosmosPaidKeys.json"
+CONFIG_FILE_PATH = "KosmoConfig.json"  # stores the keylist channel + message ids
 
 ALLOWED_USERS = ["8y.o", "kosmontop"]
 VISITOR_ROLE_NAME = "Visitor"
@@ -36,8 +37,12 @@ MOD_ROLE_NAME = "Mod"
 
 LOG_CHANNEL_NAME = "⮚︱logs❗"
 STATUS_CHANNEL_NAME = "⮚︱status"
-KEYLIST_CHANNEL_NAME = "⮚︱key-database"  # Channel where the live key database will stay
 TICKET_CATEGORY_NAME = "───🎫Tickets ───"
+
+# Channel where "KoSMOS Security" posts the "KoSMOS HUB — Authentication" embeds.
+# >>> CHANGE THIS to the real name of that channel <<<
+AUTH_LOG_CHANNEL_NAME = "⮚︱auth-logs"
+AUTH_LOG_SCAN_LIMIT = 1000  # how many past auth messages are scanned for Roblox usernames
 
 EXPIRY_CHECK_MINUTES = 1  # how often expired keys are removed
 
@@ -204,6 +209,9 @@ class KosmoBot(commands.Bot):
             except Exception as e:
                 print(f"[STATUS INIT ERROR] {e}")
 
+        # Refresh the live key database once at startup (no-op if no channel is set)
+        request_keylist_refresh()
+
 
 bot = KosmoBot()
 
@@ -284,7 +292,9 @@ class GitHubError(Exception):
 _keys_lock = asyncio.Lock()
 _read_cache = {"data": None, "time": 0.0}
 
-GITHUB_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{FILE_PATH}"
+
+def _github_url(path: str) -> str:
+    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
 
 
 def _github_headers():
@@ -296,21 +306,21 @@ def _github_headers():
     }
 
 
-async def _fetch_keys():
+async def _fetch_json(path: str):
     try:
         async with bot.http_session.get(
-            GITHUB_URL, headers=_github_headers(), params={"ref": GITHUB_BRANCH}
+            _github_url(path), headers=_github_headers(), params={"ref": GITHUB_BRANCH}
         ) as res:
             if res.status == 200:
                 data = await res.json()
                 raw = base64.b64decode(data["content"]).decode("utf-8")
                 try:
-                    keys = json.loads(raw) if raw.strip() else {}
+                    content = json.loads(raw) if raw.strip() else {}
                 except json.JSONDecodeError:
-                    raise GitHubError("the keys file is not valid JSON, refusing to overwrite it")
-                if not isinstance(keys, dict):
-                    raise GitHubError("the keys file has an unexpected format")
-                return keys, data["sha"]
+                    raise GitHubError(f"{path} is not valid JSON, refusing to overwrite it")
+                if not isinstance(content, dict):
+                    raise GitHubError(f"{path} has an unexpected format")
+                return content, data["sha"]
             if res.status == 404:
                 return {}, None
             raise GitHubError(f"GET returned HTTP {res.status}")
@@ -320,10 +330,10 @@ async def _fetch_keys():
         raise GitHubError("GitHub timed out")
 
 
-async def _put_keys(keys, sha):
+async def _put_json(path: str, content, sha):
     payload = {
-        "message": "Updated keys database via Discord Bot",
-        "content": base64.b64encode(json.dumps(keys, indent=4).encode("utf-8")).decode("utf-8"),
+        "message": "Updated database via Discord Bot",
+        "content": base64.b64encode(json.dumps(content, indent=4).encode("utf-8")).decode("utf-8"),
         "branch": GITHUB_BRANCH,
     }
     if sha:
@@ -331,11 +341,15 @@ async def _put_keys(keys, sha):
 
     try:
         async with bot.http_session.put(
-            GITHUB_URL, json=payload, headers=_github_headers()
+            _github_url(path), json=payload, headers=_github_headers()
         ) as res:
             return res.status
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         raise GitHubError(f"network error ({e})")
+
+
+async def _fetch_keys():
+    return await _fetch_json(FILE_PATH)
 
 
 async def read_keys(max_age: float = 0.0):
@@ -347,143 +361,25 @@ async def read_keys(max_age: float = 0.0):
     return keys
 
 
-async def modify_keys(mutator):
+async def modify_json(path: str, mutator):
     async with _keys_lock:
         for _ in range(3):
-            keys, sha = await _fetch_keys()
-            changed, result = mutator(keys)
+            content, sha = await _fetch_json(path)
+            changed, result = mutator(content)
             if not changed:
                 return result
-            status = await _put_keys(keys, sha)
+            status = await _put_json(path, content, sha)
             if status in (200, 201):
-                _read_cache["data"] = None
+                if path == FILE_PATH:
+                    _read_cache["data"] = None
                 return result
             if status not in (409, 422):
                 raise GitHubError(f"PUT returned HTTP {status}")
         raise GitHubError("the file kept changing, please try again")
 
 
-# --- LIVE KEYLIST DATABASE & STAFF DM HELPERS ---
-def build_keylist_embeds(keys_data: dict) -> list[discord.Embed]:
-    """Generate clean database embeds representing all current keys."""
-    title = "🗄️ KoSMO Key Database (Live)"
-    if not keys_data:
-        embed = discord.Embed(
-            title=title,
-            description="*No keys currently registered in the database.*",
-            color=discord.Color.purple(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.set_footer(text="Total keys: 0 • Auto-updates on every change")
-        return [embed]
-
-    lines = []
-    for k, v in keys_data.items():
-        v = v if isinstance(v, dict) else {}
-        status = "🔴 Used" if v.get("used") else "🟢 Available"
-        rank = v.get("rank", "Standard")
-        owner_tag = f" | 👤 {v['assigned_to']}" if v.get("assigned_to") else ""
-        lines.append(f"`{k}` | 👑 **{rank}** | {status} | {expiry_text(v)}{owner_tag}")
-
-    chunks, current, size = [], [], 0
-    for line in lines:
-        if size + len(line) + 1 > 3800 and current:
-            chunks.append(current)
-            current, size = [], 0
-        current.append(line)
-        size += len(line) + 1
-    chunks.append(current)
-
-    embeds = []
-    for i, chunk in enumerate(chunks):
-        embed = discord.Embed(
-            title=title if i == 0 else f"{title} (Page {i + 1})",
-            description="\n".join(chunk),
-            color=discord.Color.purple(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        if i == len(chunks) - 1:
-            embed.set_footer(text=f"Total keys: {len(keys_data)} • Auto-updates on every change")
-        embeds.append(embed)
-    return embeds
-
-
-async def update_live_keylist(target_channel: Optional[discord.TextChannel] = None):
-    """Automatically refreshes the live key database message in KEYLIST_CHANNEL_NAME or target_channel."""
-    try:
-        keys_data = await read_keys()
-    except GitHubError as e:
-        print(f"[LIVE KEYLIST ERROR] Could not fetch keys: {e}")
-        return
-
-    embeds = build_keylist_embeds(keys_data)
-    channels_to_update = []
-
-    if target_channel:
-        channels_to_update.append(target_channel)
-    else:
-        for guild in bot.guilds:
-            ch = discord.utils.get(guild.text_channels, name=KEYLIST_CHANNEL_NAME)
-            if ch:
-                channels_to_update.append(ch)
-
-    for channel in channels_to_update:
-        try:
-            existing_msgs = []
-            async for msg in channel.history(limit=25):
-                if msg.author == bot.user and msg.embeds:
-                    if (msg.embeds[0].title or "").startswith("🗄️ KoSMO Key Database"):
-                        existing_msgs.append(msg)
-
-            existing_msgs.reverse()  # oldest first
-
-            if len(existing_msgs) == len(embeds):
-                for idx, msg in enumerate(existing_msgs):
-                    is_last = idx == len(embeds) - 1
-                    await msg.edit(
-                        embed=embeds[idx], view=KeyManagementView() if is_last else None
-                    )
-            else:
-                for old_msg in existing_msgs:
-                    try:
-                        await old_msg.delete()
-                    except discord.HTTPException:
-                        pass
-                for idx, emb in enumerate(embeds):
-                    is_last = idx == len(embeds) - 1
-                    await channel.send(
-                        embed=emb, view=KeyManagementView() if is_last else None
-                    )
-        except Exception as e:
-            print(f"[LIVE KEYLIST UPDATE ERROR in #{channel.name}] {e}")
-
-
-async def notify_staff_key_created(
-    key: str, rank: str, duration_line: str, created_by: str, assigned_to: str
-):
-    """Sends a direct message to all allowed staff users whenever a new key is created."""
-    embed = discord.Embed(
-        title="🔔 New Key Generated",
-        description="A new access key has been added to the database.",
-        color=discord.Color.green(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="🔑 Key", value=f"`{key}`", inline=False)
-    embed.add_field(name="👑 Rank", value=f"**{rank}**", inline=True)
-    embed.add_field(name="⏳ Duration", value=duration_line, inline=True)
-    embed.add_field(name="👤 Created For", value=assigned_to, inline=True)
-    embed.add_field(name="🛠️ Generated By", value=created_by, inline=True)
-    embed.set_footer(text="KoSMO Hub • Staff Audit Notification")
-
-    notified_ids = set()
-    for guild in bot.guilds:
-        for member in guild.members:
-            if member.name in ALLOWED_USERS and member.id not in notified_ids:
-                notified_ids.add(member.id)
-                try:
-                    await member.send(embed=embed)
-                except Exception as e:
-                    print(f"[STAFF DM ERROR] Could not DM {member.name}: {e}")
+async def modify_keys(mutator):
+    return await modify_json(FILE_PATH, mutator)
 
 
 # --- KEY HELPERS ---
@@ -496,27 +392,38 @@ def generate_key_string(existing) -> str:
 
 
 async def create_key(
-    duration_text: str, rank: str = "Standard", assigned_to: Optional[str] = None
+    duration_text: str,
+    rank: str = "Standard",
+    owner: Union[discord.abc.User, str, None] = None,
 ):
+    """Create a key. `owner` = who the key is for (Discord user, plain text, or None)."""
     label, expires_at = parse_duration(duration_text)
+
+    owner_id = getattr(owner, "id", None)
+    if owner is None:
+        owner_name = None
+    elif hasattr(owner, "name"):
+        owner_name = owner.name
+    else:
+        owner_name = str(owner)
 
     def mutator(keys):
         key = generate_key_string(keys)
-        entry = {
+        keys[key] = {
             "hwid": None,
             "used": False,
             "rank": rank,
             "duration": label,
+            "owner_id": owner_id,
+            "owner_name": owner_name,
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "expires_at": expires_at.isoformat(timespec="seconds") if expires_at else None,
             "expires_ts": int(expires_at.timestamp()) if expires_at else None,
         }
-        if assigned_to:
-            entry["assigned_to"] = assigned_to
-        keys[key] = entry
         return True, key
 
     key = await modify_keys(mutator)
+    request_keylist_refresh()
     return key, label, expires_at
 
 
@@ -546,6 +453,44 @@ async def send_to_log_channels(embed: discord.Embed):
                 print(f"[LOG ERROR] {e}")
 
 
+async def dm_creator(
+    creator: discord.abc.User,
+    target: Union[discord.abc.User, str, None],
+    key: str,
+    rank: str,
+    label: str,
+    expires_at: Optional[datetime],
+):
+    """DM the staff member who created the key: which key, and who it is for."""
+    if isinstance(target, str):
+        target_text = target
+    elif target is not None:
+        target_text = f"{target.mention} (`{target.name}`)"
+    else:
+        target_text = "— (not assigned)"
+
+    embed = discord.Embed(
+        title="🔑 Key Created",
+        description="A new key has been added to the database.",
+        color=discord.Color.purple(),
+    )
+    embed.add_field(name="🔑 Key", value=f"`{key}`", inline=False)
+    embed.add_field(name="👤 For", value=target_text, inline=False)
+    embed.add_field(name="👑 Rank", value=f"**{rank}**", inline=True)
+    embed.add_field(
+        name="⏳ Duration",
+        value="♾️ **Lifetime**"
+        if expires_at is None
+        else f"**{describe_duration(label)}**\nExpires <t:{int(expires_at.timestamp())}:R>",
+        inline=True,
+    )
+    embed.set_footer(text="KoSMO Hub • Key Database")
+    try:
+        await creator.send(embed=embed)
+    except Exception as e:
+        print(f"[DM CREATOR ERROR] {e}")
+
+
 @tasks.loop(minutes=1)
 async def expire_keys_loop():
     try:
@@ -562,12 +507,203 @@ async def expire_keys_loop():
             color=discord.Color.orange(),
         )
         await send_to_log_channels(embed)
-        await update_live_keylist()
+        request_keylist_refresh()
 
 
 @expire_keys_loop.before_loop
 async def _before_expire_loop():
     await bot.wait_until_ready()
+
+
+# --- LIVE KEY DATABASE (keylist channel) ---
+_keylist_lock = asyncio.Lock()
+_bg_tasks: set = set()
+_known_auth_pairs: set = set()
+
+
+def _clean_field(value: str) -> str:
+    return (value or "").replace("`", "").strip()
+
+
+def extract_auth_fields(embed: discord.Embed):
+    """Return (license_key, roblox_username) from a 'KoSMOS HUB — Authentication' embed."""
+    fields = {f.name.strip().lower(): _clean_field(f.value) for f in embed.fields}
+    return fields.get("license key"), fields.get("roblox username")
+
+
+async def get_roblox_usernames(guild: discord.Guild) -> Dict[str, List[str]]:
+    """Map license key -> list of unique Roblox usernames, read from the auth log channel."""
+    result: Dict[str, List[str]] = {}
+    channel = discord.utils.get(guild.text_channels, name=AUTH_LOG_CHANNEL_NAME)
+    if not channel:
+        return result
+    try:
+        async for message in channel.history(limit=AUTH_LOG_SCAN_LIMIT, oldest_first=False):
+            for embed in message.embeds:
+                key, username = extract_auth_fields(embed)
+                if key and username:
+                    result.setdefault(key, []).append(username)
+    except Exception as e:
+        print(f"[AUTH LOG SCAN ERROR] {e}")
+    return result
+
+
+def unique_usernames(names: List[str]) -> List[str]:
+    seen, out = set(), []
+    for n in names:
+        low = n.lower()
+        if low not in seen:
+            seen.add(low)
+            out.append(n)
+    return out
+
+
+def owner_text(entry: dict) -> str:
+    if entry.get("owner_id"):
+        return f"<@{entry['owner_id']}>"
+    if entry.get("owner_name"):
+        return f"`{entry['owner_name']}`"
+    return "—"
+
+
+def build_keylist_embeds(keys: dict, roblox_map: Dict[str, List[str]]) -> List[discord.Embed]:
+    title = "🗂️ KoSMO Key Database"
+    now = datetime.now(timezone.utc)
+
+    if not keys:
+        embed = discord.Embed(
+            title=title, description="*No keys currently saved.*", color=discord.Color.purple()
+        )
+        embed.set_footer(text="Total keys: 0")
+        embed.timestamp = now
+        return [embed]
+
+    blocks = []
+    for k, v in keys.items():
+        v = v if isinstance(v, dict) else {}
+        status = "🔴 Used" if v.get("used") else "🟢 Available"
+        rank = v.get("rank", "Standard")
+
+        names = list(roblox_map.get(k, []))
+        # also support usernames saved directly in the keys file, if any
+        if v.get("roblox_username"):
+            names.append(str(v["roblox_username"]))
+        for extra in v.get("roblox_usernames", []) or []:
+            names.append(str(extra))
+        names = unique_usernames(names)
+        roblox = ", ".join(f"`{n}`" for n in names) if names else "—"
+
+        blocks.append(
+            f"`{k}` | 👑 **{rank}** | {status} | {expiry_text(v)}\n"
+            f"↳ 👤 {owner_text(v)} | 🎮 {roblox}"
+        )
+
+    chunks, current, size = [], [], 0
+    for block in blocks:
+        if size + len(block) + 2 > 3800 and current:
+            chunks.append(current)
+            current, size = [], 0
+        current.append(block)
+        size += len(block) + 2
+    chunks.append(current)
+
+    embeds = []
+    for i, chunk in enumerate(chunks):
+        embed = discord.Embed(
+            title=title if i == 0 else f"{title} (page {i + 1})",
+            description="\n\n".join(chunk),
+            color=discord.Color.purple(),
+        )
+        embed.set_footer(text=f"Total keys: {len(keys)} • Updated")
+        embed.timestamp = now
+        embeds.append(embed)
+    return embeds
+
+
+async def refresh_keylist():
+    """Rebuild the key database embed(s) in the configured channel (edits existing messages)."""
+    async with _keylist_lock:
+        cfg, _ = await _fetch_json(CONFIG_FILE_PATH)
+        channel_id = cfg.get("keylist_channel_id")
+        if not channel_id:
+            return
+        channel = bot.get_channel(int(channel_id))
+        if not isinstance(channel, discord.TextChannel):
+            print("[KEYLIST] Configured channel not found, run /keylist_channel again")
+            return
+
+        keys = await read_keys()
+        roblox_map = await get_roblox_usernames(channel.guild)
+        embeds = build_keylist_embeds(keys, roblox_map)
+
+        old_ids = list(cfg.get("keylist_message_ids", []))
+        new_ids = []
+        for i, embed in enumerate(embeds):
+            msg = None
+            if i < len(old_ids):
+                try:
+                    msg = await channel.fetch_message(int(old_ids[i]))
+                    old_desc = msg.embeds[0].description if msg.embeds else None
+                    if old_desc != embed.description or (
+                        msg.embeds and msg.embeds[0].footer.text != embed.footer.text
+                    ):
+                        await msg.edit(embed=embed)
+                except discord.NotFound:
+                    msg = None
+            if msg is None:
+                msg = await channel.send(embed=embed)
+            new_ids.append(msg.id)
+
+        for extra_id in old_ids[len(embeds):]:
+            try:
+                extra = await channel.fetch_message(int(extra_id))
+                await extra.delete()
+            except Exception:
+                pass
+
+        if new_ids != old_ids:
+
+            def mutator(c):
+                c["keylist_message_ids"] = new_ids
+                return True, True
+
+            await modify_json(CONFIG_FILE_PATH, mutator)
+
+
+async def _safe_refresh():
+    try:
+        await refresh_keylist()
+    except Exception as e:
+        print(f"[KEYLIST ERROR] {e!r}")
+
+
+def request_keylist_refresh():
+    """Fire-and-forget refresh of the key database embed."""
+    try:
+        task = asyncio.get_running_loop().create_task(_safe_refresh())
+    except RuntimeError:
+        return
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+@bot.listen("on_message")
+async def auth_log_listener(message: discord.Message):
+    """When a new auth log arrives, update the Roblox usernames in the key database."""
+    if not message.guild or not message.embeds:
+        return
+    if getattr(message.channel, "name", None) != AUTH_LOG_CHANNEL_NAME:
+        return
+    new_pair = False
+    for embed in message.embeds:
+        key, username = extract_auth_fields(embed)
+        if key and username:
+            pair = (key, username.lower())
+            if pair not in _known_auth_pairs:
+                _known_auth_pairs.add(pair)
+                new_pair = True
+    if new_pair:
+        request_keylist_refresh()
 
 
 # --- TICKET SYSTEM VIEWS & SELECTS ---
@@ -880,14 +1016,28 @@ class DeleteKeySelect(Select):
             return
 
         if deleted:
+            request_keylist_refresh()
             await interaction.followup.send(
-                f"🗑️ Key `{key_to_delete}` successfully deleted!", ephemeral=True
+                f"🗑️ Key {key_to_delete} successfully deleted!", ephemeral=True
             )
-            await update_live_keylist()
         else:
             await interaction.followup.send(
-                f"❌ Key `{key_to_delete}` no longer exists.", ephemeral=True
+                f"❌ Key {key_to_delete} no longer exists.", ephemeral=True
             )
+
+
+def resolve_owner(guild: Optional[discord.Guild], text: str) -> Union[discord.Member, str, None]:
+    """Turn the 'For' text (Discord ID / username / free text) into a Member when possible."""
+    text = (text or "").strip().lstrip("@")
+    if not text:
+        return None
+    member = None
+    if guild:
+        if text.isdigit():
+            member = guild.get_member(int(text))
+        if member is None:
+            member = guild.get_member_named(text)
+    return member or text
 
 
 class CreateKeyModal(Modal, title="Create Key"):
@@ -905,11 +1055,11 @@ class CreateKeyModal(Modal, title="Create Key"):
         min_length=2,
         max_length=20,
     )
-    recipient = TextInput(
-        label="For who? (Optional username or note)",
-        placeholder="e.g. buyer123 or self",
+    owner = TextInput(
+        label="For (Discord username or ID)",
+        placeholder="e.g. kosmontop or 123456789012345678",
         required=False,
-        max_length=50,
+        max_length=60,
     )
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -920,11 +1070,11 @@ class CreateKeyModal(Modal, title="Create Key"):
             return
         await interaction.response.defer(ephemeral=True)
 
-        assigned = self.recipient.value.strip() if self.recipient.value else interaction.user.name
+        target = resolve_owner(interaction.guild, self.owner.value)
 
         try:
             key, label, expires_at = await create_key(
-                self.duration.value, self.rank.value, assigned_to=assigned
+                self.duration.value, self.rank.value, owner=target
             )
         except DurationError as e:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
@@ -940,25 +1090,16 @@ class CreateKeyModal(Modal, title="Create Key"):
             if expires_at is None
             else f"⏳ {describe_duration(label)} — expires <t:{int(expires_at.timestamp())}:F> (<t:{int(expires_at.timestamp())}:R>)"
         )
-        duration_short = (
-            "Lifetime"
-            if expires_at is None
-            else f"{describe_duration(label)} (<t:{int(expires_at.timestamp())}:R>)"
+        for_line = (
+            f"\n👤 **For:** {target.mention}"
+            if isinstance(target, discord.abc.User)
+            else (f"\n👤 **For:** `{target}`" if target else "")
         )
-
         await interaction.followup.send(
-            f"🔑 **New Key Created:** `{key}`\n👑 **Rank:** {self.rank.value}\n👤 **For:** {assigned}\n{expiry_line}",
+            f"🔑 **New Key Created:** {key}\n👑 **Rank:** {self.rank.value}\n{expiry_line}{for_line}",
             ephemeral=True,
         )
-
-        await update_live_keylist()
-        await notify_staff_key_created(
-            key=key,
-            rank=self.rank.value,
-            duration_line=duration_short,
-            created_by=f"{interaction.user.mention} ({interaction.user.name})",
-            assigned_to=assigned,
-        )
+        await dm_creator(interaction.user, target, key, self.rank.value, label, expires_at)
 
 
 class KeyManagementView(View):
@@ -1018,31 +1159,6 @@ async def finish_panel_command(ctx: commands.Context):
             await ctx.message.delete()
         except Exception:
             pass
-
-
-@bot.hybrid_command(
-    name="keylist_channel",
-    description="Publish or refresh the live key database in the designated database channel",
-)
-@app_commands.describe(
-    channel="Optional specific channel (defaults to configured KEYLIST_CHANNEL_NAME)"
-)
-@staff_only()
-async def keylist_channel(ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
-    await ctx.defer(ephemeral=True)
-    target = channel or discord.utils.get(ctx.guild.text_channels, name=KEYLIST_CHANNEL_NAME)
-
-    if not target:
-        await ctx.send(
-            f"❌ Could not find channel `{KEYLIST_CHANNEL_NAME}`. Please create it or specify a channel argument.",
-            ephemeral=True,
-        )
-        return
-
-    await update_live_keylist(target_channel=target)
-    await ctx.send(
-        f"✅ Live Key Database published and synced in {target.mention}!", ephemeral=True
-    )
 
 
 @bot.hybrid_command(
@@ -1155,6 +1271,63 @@ async def supportpanel(ctx: commands.Context):
     await finish_panel_command(ctx)
 
 
+@bot.hybrid_command(
+    name="keylist_channel",
+    description="Set the channel where the live key database (keys, owners, Roblox users) is posted",
+)
+@app_commands.describe(channel="Channel for the key database (default: the current channel)")
+@staff_only()
+async def keylist_channel(ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
+    await ctx.defer(ephemeral=True)
+    target = channel or ctx.channel
+    if not isinstance(target, discord.TextChannel):
+        await ctx.send("❌ Please use a normal text channel.", ephemeral=True)
+        return
+
+    cfg, _ = await _fetch_json(CONFIG_FILE_PATH)
+    old_channel_id = cfg.get("keylist_channel_id")
+
+    # If the database moves to another channel, remove the old messages
+    if old_channel_id and int(old_channel_id) != target.id:
+        old_channel = bot.get_channel(int(old_channel_id))
+        if isinstance(old_channel, discord.TextChannel):
+            for mid in cfg.get("keylist_message_ids", []):
+                try:
+                    old_msg = await old_channel.fetch_message(int(mid))
+                    await old_msg.delete()
+                except Exception:
+                    pass
+
+        def mutator(c):
+            c["keylist_channel_id"] = target.id
+            c["keylist_message_ids"] = []
+            return True, True
+
+        await modify_json(CONFIG_FILE_PATH, mutator)
+    elif not old_channel_id:
+
+        def mutator(c):
+            c["keylist_channel_id"] = target.id
+            c["keylist_message_ids"] = []
+            return True, True
+
+        await modify_json(CONFIG_FILE_PATH, mutator)
+
+    try:
+        await refresh_keylist()
+    except discord.Forbidden:
+        await ctx.send(
+            f"❌ I can't send messages in {target.mention}. Check my permissions there.",
+            ephemeral=True,
+        )
+        return
+
+    await ctx.send(
+        f"✅ Key database is now live in {target.mention} and updates automatically.",
+        ephemeral=True,
+    )
+
+
 @bot.hybrid_command(name="genkey", description="Generate an access key and send it by DM")
 @app_commands.describe(
     duration="lt = lifetime, or number + m (minutes) / h (hours) / d (days) / mo (months) / y (years). Ex: 5m, 1h, 7d",
@@ -1187,9 +1360,7 @@ async def genkey(
     msg = await ctx.send("⏳ *Saving key to GitHub...*", ephemeral=True)
 
     try:
-        new_key, label, expires_at = await create_key(
-            duration, rank, assigned_to=target_user.name
-        )
+        new_key, label, expires_at = await create_key(duration, rank, owner=target_user)
     except GitHubError as e:
         await msg.edit(content=f"❌ Error saving key to GitHub: {e}")
         return
@@ -1228,16 +1399,6 @@ async def genkey(
         else f"{describe_duration(label)}, expires <t:{int(expires_at.timestamp())}:R>"
     )
 
-    # Update live key database & notify staff via DM
-    await update_live_keylist()
-    await notify_staff_key_created(
-        key=new_key,
-        rank=rank,
-        duration_line=duration_line,
-        created_by=f"{ctx.author.mention} ({ctx.author.name})",
-        assigned_to=f"{target_user.mention} ({target_user.name})",
-    )
-
     try:
         await target_user.send(embed=embed)
         if target_user != ctx.author:
@@ -1252,6 +1413,11 @@ async def genkey(
         await msg.edit(
             content=f"✅ Key generated: `{new_key}` ({rank} | {duration_line}). Failed to send DM to {target_user.mention}, check DM settings."
         )
+
+    # DM the staff member who created it: which key, and who it is for.
+    # (If the creator is also the recipient, the DM above already contains the key.)
+    if target_user != ctx.author:
+        await dm_creator(ctx.author, target_user, new_key, rank, label, expires_at)
 
 
 @genkey.autocomplete("duration")
@@ -1293,10 +1459,10 @@ async def setrank(ctx: commands.Context, key: str, rank: str):
         return
 
     if updated:
+        request_keylist_refresh()
         await ctx.send(
             f"👑 Rank for key `{key}` successfully updated to **{rank}**!", ephemeral=True
         )
-        await update_live_keylist()
     else:
         await ctx.send(f"❌ Key `{key}` not found.", ephemeral=True)
 
@@ -1376,18 +1542,18 @@ async def reduceduration(ctx: commands.Context, key: str, reduce_by: str):
     elif result == "lifetime":
         await ctx.send("❌ Cannot reduce duration on a Lifetime key!", ephemeral=True)
     elif result == "expired":
+        request_keylist_refresh()
         await ctx.send(
             f"⚠️ Duration reduced beyond remaining time. Key `{key}` has expired and been removed.",
             ephemeral=True,
         )
-        await update_live_keylist()
     else:
+        request_keylist_refresh()
         ts = int(result.timestamp())
         await ctx.send(
             f"📉 Reduced duration for key `{key}`! New expiration: <t:{ts}:F> (<t:{ts}:R>)",
             ephemeral=True,
         )
-        await update_live_keylist()
 
 
 @reduceduration.autocomplete("key")
@@ -1424,10 +1590,40 @@ async def reduceduration_autocomplete(interaction: discord.Interaction, current:
 async def keylist(ctx: commands.Context):
     await ctx.defer(ephemeral=True)
     keys_data = await read_keys()
-    embeds = build_keylist_embeds(keys_data)
+    title = "🔑 KoSMO Key Management (HWID Bound)"
 
-    for i, embed in enumerate(embeds):
-        is_last = i == len(embeds) - 1
+    if not keys_data:
+        embed = discord.Embed(
+            title=title, description="*No keys currently saved.*", color=discord.Color.purple()
+        )
+        await ctx.send(embed=embed, view=KeyManagementView(), ephemeral=True)
+        return
+
+    lines = []
+    for k, v in keys_data.items():
+        v = v if isinstance(v, dict) else {}
+        status = "🔴 Used" if v.get("used") else "🟢 Available"
+        rank = v.get("rank", "Standard")
+        lines.append(f"`{k}` | 👑 **{rank}** | {status} | {expiry_text(v)}")
+
+    chunks, current, size = [], [], 0
+    for line in lines:
+        if size + len(line) + 1 > 3800 and current:
+            chunks.append(current)
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    chunks.append(current)
+
+    for i, chunk in enumerate(chunks):
+        embed = discord.Embed(
+            title=title if i == 0 else f"{title} (page {i + 1})",
+            description="\n".join(chunk),
+            color=discord.Color.purple(),
+        )
+        if i == 0:
+            embed.set_footer(text=f"Total keys: {len(keys_data)}")
+        is_last = i == len(chunks) - 1
         await ctx.send(
             embed=embed,
             view=KeyManagementView() if is_last else discord.utils.MISSING,
@@ -1449,8 +1645,8 @@ async def deletekey(ctx: commands.Context, key: str):
         return False, False
 
     if await modify_keys(mutator):
+        request_keylist_refresh()
         await ctx.send(f"🗑️ Key `{key}` successfully deleted!", ephemeral=True)
-        await update_live_keylist()
     else:
         await ctx.send(f"❌ Key `{key}` not found.", ephemeral=True)
 
