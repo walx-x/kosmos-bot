@@ -37,7 +37,7 @@ KOSMO_MEMBER_ROLE_NAME = "KoSMO Member"
 MOD_ROLE_NAME = "Mod"
 
 LOG_CHANNEL_NAME = "⮚︱logs❗"
-STATUS_CHANNEL_NAME = "⮚︱status"
+STATUS_CHANNEL_NAME = "✴︱status"
 TICKET_CATEGORY_NAME = "───🎫Tickets ───"
 
 # Channel where "KoSMOS Security" posts the "KoSMOS HUB — Authentication" embeds.
