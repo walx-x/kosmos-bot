@@ -8,6 +8,7 @@ import secrets
 import string
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Union
+from urllib.parse import quote
 
 import aiohttp
 import discord
@@ -41,7 +42,7 @@ TICKET_CATEGORY_NAME = "───🎫Tickets ───"
 
 # Channel where "KoSMOS Security" posts the "KoSMOS HUB — Authentication" embeds.
 # >>> CHANGE THIS to the real name of that channel <<<
-AUTH_LOG_CHANNEL_NAME = "kosmoactivation"
+AUTH_LOG_CHANNEL_NAME = "⮚︱auth-logs"
 AUTH_LOG_SCAN_LIMIT = 1000  # how many past auth messages are scanned for Roblox usernames
 
 EXPIRY_CHECK_MINUTES = 1  # how often expired keys are removed
@@ -49,6 +50,16 @@ EXPIRY_CHECK_MINUTES = 1  # how often expired keys are removed
 GITHUB_ASSETS = "https://raw.githubusercontent.com/walx-x/kosmos-bot/refs/heads/main"
 LOGO_IMAGE_URL = f"{GITHUB_ASSETS}/kosmologo.png"
 BANNER_IMAGE_URL = f"{GITHUB_ASSETS}/kosmobanner.png"
+
+# Files that /file and /autofile can send (stored in the kosmos-bot repo)
+DOWNLOAD_REPO = "walx-x/kosmos-bot"
+DOWNLOAD_BRANCH = "main"
+DOWNLOAD_FILES = {
+    "launcher": {"label": "launcher.exe", "path": "launcher.exe", "emoji": "🚀"},
+    "zip": {"label": "KosmoLauncher.zip", "path": "KosmoLauncher.zip", "emoji": "📦"},
+}
+RANK_ORDER = {"standard": 0, "pro": 1, "vip": 2}
+MAX_DM_FILE_BYTES = 9 * 1024 * 1024  # bigger files are sent as a link only
 
 STATUS_CONFIG = {
     "active": {
@@ -424,6 +435,8 @@ async def create_key(
 
     key = await modify_keys(mutator)
     request_keylist_refresh()
+    if owner_id:
+        schedule_autofile(owner_id, rank)
     return key, label, expires_at
 
 
@@ -704,6 +717,131 @@ async def auth_log_listener(message: discord.Message):
                 new_pair = True
     if new_pair:
         request_keylist_refresh()
+
+
+# --- FILE DOWNLOADS (/file, /autofile) ---
+def rank_value(rank) -> int:
+    return RANK_ORDER.get(str(rank or "").strip().lower(), 0)
+
+
+def download_url(path: str) -> str:
+    return f"https://raw.githubusercontent.com/{DOWNLOAD_REPO}/refs/heads/{DOWNLOAD_BRANCH}/{quote(path)}"
+
+
+async def fetch_file_bytes(path: str) -> Optional[bytes]:
+    """Download a file from the repo. Returns None if unavailable or too big for a DM."""
+    timeout = aiohttp.ClientTimeout(total=60)
+    attempts = [(download_url(path), {}, {})]
+    if GITHUB_TOKEN:
+        attempts.append(
+            (
+                f"https://api.github.com/repos/{DOWNLOAD_REPO}/contents/{quote(path)}",
+                {**_github_headers(), "Accept": "application/vnd.github.raw"},
+                {"ref": DOWNLOAD_BRANCH},
+            )
+        )
+    for url, headers, params in attempts:
+        try:
+            async with bot.http_session.get(
+                url, headers=headers, params=params, timeout=timeout
+            ) as res:
+                if res.status != 200:
+                    continue
+                if res.content_length and res.content_length > MAX_DM_FILE_BYTES:
+                    return None
+                data = await res.read()
+                return data if len(data) <= MAX_DM_FILE_BYTES else None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f"[FILE FETCH ERROR] {e!r}")
+    return None
+
+
+async def send_file_dm(user: discord.abc.User, file_key: str, method: str = "link") -> str:
+    """DM a file to `user`. method = 'link' (download button) or 'file' (attachment + button).
+    Returns what was actually sent: 'file' or 'link'. Raises discord.Forbidden if DMs are closed."""
+    info = DOWNLOAD_FILES[file_key]
+    url = download_url(info["path"])
+
+    embed = discord.Embed(
+        title=f"{info['emoji']} KoSMO — {info['label']}",
+        description="Your download is ready. Use the button below to get the file.",
+        color=discord.Color.purple(),
+    )
+    embed.set_thumbnail(url=LOGO_IMAGE_URL)
+    embed.set_footer(text="KoSMO Hub • Official Download")
+
+    view = View()
+    view.add_item(Button(label="Download", style=discord.ButtonStyle.link, url=url, emoji="⬇️"))
+
+    kwargs = {"embed": embed, "view": view}
+    sent_as = "link"
+    if method == "file":
+        data = await fetch_file_bytes(info["path"])
+        if data:
+            kwargs["file"] = discord.File(io.BytesIO(data), filename=info["path"])
+            sent_as = "file"
+
+    await user.send(**kwargs)
+    return sent_as
+
+
+async def get_user_by_id(user_id: int) -> Optional[discord.User]:
+    user = bot.get_user(int(user_id))
+    if user:
+        return user
+    try:
+        return await bot.fetch_user(int(user_id))
+    except discord.HTTPException:
+        return None
+
+
+async def broadcast_file(file_key: str, method: str, min_rank: str):
+    """Send the file to every key owner whose key rank is >= min_rank (one DM per person)."""
+    keys = await read_keys()
+    owner_ids = {
+        int(v["owner_id"])
+        for v in keys.values()
+        if isinstance(v, dict)
+        and v.get("owner_id")
+        and rank_value(v.get("rank")) >= rank_value(min_rank)
+    }
+    sent = failed = 0
+    for uid in owner_ids:
+        user = await get_user_by_id(uid)
+        try:
+            if user is None:
+                raise discord.NotFound
+            await send_file_dm(user, file_key, method)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(1)  # stay well under Discord rate limits
+    return sent, failed
+
+
+async def _autofile_task(owner_id: int, rank: str):
+    try:
+        cfg, _ = await _fetch_json(CONFIG_FILE_PATH)
+        file_key = cfg.get("autofile_file")
+        if file_key not in DOWNLOAD_FILES:
+            return
+        if rank_value(rank) < rank_value(cfg.get("autofile_min_rank", "Standard")):
+            return
+        user = await get_user_by_id(owner_id)
+        if user:
+            await send_file_dm(user, file_key, cfg.get("autofile_method", "link"))
+    except Exception as e:
+        print(f"[AUTOFILE ERROR] {e!r}")
+
+
+def schedule_autofile(owner_id: int, rank: str):
+    """If /autofile is on and this key's rank qualifies, DM the file to the key owner."""
+    try:
+        task = asyncio.get_running_loop().create_task(_autofile_task(owner_id, rank))
+    except RuntimeError:
+        return
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 # --- TICKET SYSTEM VIEWS & SELECTS ---
@@ -1326,6 +1464,126 @@ async def keylist_channel(ctx: commands.Context, channel: Optional[discord.TextC
         f"✅ Key database is now live in {target.mention} and updates automatically.",
         ephemeral=True,
     )
+
+
+FILE_CHOICES = [
+    app_commands.Choice(name="🚀 launcher.exe", value="launcher"),
+    app_commands.Choice(name="📦 KosmoLauncher.zip", value="zip"),
+]
+METHOD_CHOICES = [
+    app_commands.Choice(name="🔗 Download link (button)", value="link"),
+    app_commands.Choice(name="📎 Direct file (+ link as backup)", value="file"),
+]
+RANK_CHOICES = [
+    app_commands.Choice(name="Standard and up", value="Standard"),
+    app_commands.Choice(name="Pro and up", value="Pro"),
+    app_commands.Choice(name="VIP only", value="VIP"),
+]
+
+
+@bot.hybrid_command(
+    name="file", description="Send a download (launcher.exe / KosmoLauncher.zip) by DM"
+)
+@app_commands.describe(
+    file="Which file to send",
+    method="Send a download link or the file itself",
+    member="Send it to this person (default: you)",
+    min_rank="Instead: send to everyone owning a key of this rank or higher",
+)
+@app_commands.choices(file=FILE_CHOICES, method=METHOD_CHOICES, min_rank=RANK_CHOICES)
+@staff_only()
+async def file_command(
+    ctx: commands.Context,
+    file: str,
+    method: str = "link",
+    member: Optional[discord.Member] = None,
+    min_rank: Optional[str] = None,
+):
+    await ctx.defer(ephemeral=True)
+    if file not in DOWNLOAD_FILES:
+        await ctx.send("❌ Unknown file. Use: launcher or zip.", ephemeral=True)
+        return
+    if method not in ("link", "file"):
+        method = "link"
+    label = DOWNLOAD_FILES[file]["label"]
+
+    if member and min_rank:
+        await ctx.send("❌ Choose either a member or a min_rank, not both.", ephemeral=True)
+        return
+
+    if min_rank:
+        if rank_value(min_rank) == 0 and min_rank.strip().lower() != "standard":
+            await ctx.send("❌ Rank must be Standard, Pro or VIP.", ephemeral=True)
+            return
+        sent, failed = await broadcast_file(file, method, min_rank)
+        await ctx.send(
+            f"✅ **{label}** sent to **{sent}** key owner(s) with rank **{min_rank}+**."
+            + (f"\n⚠️ {failed} could not be reached (DMs closed or user not found)." if failed else ""),
+            ephemeral=True,
+        )
+        return
+
+    target = member or ctx.author
+    try:
+        sent_as = await send_file_dm(target, file, method)
+    except discord.Forbidden:
+        await ctx.send(f"❌ I can't DM {target.mention}, their DMs are closed.", ephemeral=True)
+        return
+
+    how = "as a file" if sent_as == "file" else "as a download link"
+    note = (
+        "\n*(File too big or unavailable, sent as a link instead.)*"
+        if method == "file" and sent_as == "link"
+        else ""
+    )
+    await ctx.send(f"✅ **{label}** sent {how} to {target.mention}.{note}", ephemeral=True)
+
+
+@bot.hybrid_command(
+    name="autofile",
+    description="Auto-DM a file to new key owners of a minimum rank (or turn it off)",
+)
+@app_commands.describe(
+    file="File to send automatically, or Off",
+    min_rank="Only for keys of this rank or higher",
+    method="Send a download link or the file itself",
+)
+@app_commands.choices(
+    file=FILE_CHOICES + [app_commands.Choice(name="⛔ Off", value="off")],
+    min_rank=RANK_CHOICES,
+    method=METHOD_CHOICES,
+)
+@staff_only()
+async def autofile_command(
+    ctx: commands.Context, file: str, min_rank: str = "Standard", method: str = "link"
+):
+    await ctx.defer(ephemeral=True)
+    file = file.lower()
+    if file != "off" and file not in DOWNLOAD_FILES:
+        await ctx.send("❌ Use: launcher, zip or off.", ephemeral=True)
+        return
+    if method not in ("link", "file"):
+        method = "link"
+
+    def mutator(c):
+        if file == "off":
+            for k in ("autofile_file", "autofile_min_rank", "autofile_method"):
+                c.pop(k, None)
+        else:
+            c["autofile_file"] = file
+            c["autofile_min_rank"] = min_rank
+            c["autofile_method"] = method
+        return True, True
+
+    await modify_json(CONFIG_FILE_PATH, mutator)
+    if file == "off":
+        await ctx.send("⛔ Auto-send is now **off**.", ephemeral=True)
+    else:
+        await ctx.send(
+            f"✅ From now on, every new key of rank **{min_rank}+** automatically sends"
+            f" **{DOWNLOAD_FILES[file]['label']}** by DM to its owner ({method}).",
+            ephemeral=True,
+        )
 
 
 @bot.hybrid_command(name="genkey", description="Generate an access key and send it by DM")
